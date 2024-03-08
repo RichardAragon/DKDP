@@ -1,0 +1,85 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+def importance_score(param):
+    return torch.abs(param.grad).mean()
+
+def distillation_loss(teacher_outputs, student_outputs):
+    return nn.KLDivLoss()(nn.LogSoftmax(dim=1)(student_outputs), nn.Softmax(dim=1)(teacher_outputs))
+
+def prune_model(model, threshold):
+    for name, param in model.named_parameters():
+        if importance_score(param) < threshold:
+            param.data.mul_(0)
+
+def train_model(model, dataloader, criterion, optimizer, device):
+    model.train()
+    for inputs, labels in dataloader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+def evaluate_model(model, dataloader, criterion, device):
+    model.eval()
+    total_loss = 0
+    total_samples = 0
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item() * inputs.size(0)
+            total_samples += inputs.size(0)
+    return total_loss / total_samples
+
+def dkdp_algorithm(teacher_model, student_model, train_dataloader, val_dataloader, num_epochs, distillation_weight, pruning_threshold, device):
+    teacher_model.to(device)
+    student_model.to(device)
+
+    teacher_optimizer = optim.Adam(teacher_model.parameters(), lr=0.001)
+    student_optimizer = optim.Adam(student_model.parameters(), lr=0.001)
+
+    criterion = nn.CrossEntropyLoss()
+
+    best_student_model = None
+    best_student_loss = float('inf')
+
+    for epoch in range(num_epochs):
+        # Train the teacher model
+        train_model(teacher_model, train_dataloader, criterion, teacher_optimizer, device)
+
+        # Distill knowledge to the student model
+        student_model.train()
+        for inputs, _ in train_dataloader:
+            inputs = inputs.to(device)
+            teacher_outputs = teacher_model(inputs)
+            student_outputs = student_model(inputs)
+            distillation_loss_value = distillation_loss(teacher_outputs, student_outputs)
+            student_loss = criterion(student_outputs, teacher_outputs.argmax(dim=1))
+            overall_loss = student_loss + distillation_weight * distillation_loss_value
+            student_optimizer.zero_grad()
+            overall_loss.backward()
+            student_optimizer.step()
+
+        # Prune the teacher model
+        prune_model(teacher_model, pruning_threshold)
+
+        # Evaluate the models
+        teacher_loss = evaluate_model(teacher_model, val_dataloader, criterion, device)
+        student_loss = evaluate_model(student_model, val_dataloader, criterion, device)
+
+        print(f"Epoch [{epoch+1}/{num_epochs}], Teacher Loss: {teacher_loss:.4f}, Student Loss: {student_loss:.4f}")
+
+        # Save the best student model
+        if student_loss < best_student_loss:
+            best_student_loss = student_loss
+            best_student_model = student_model.state_dict()
+
+    # Load the best student model
+    student_model.load_state_dict(best_student_model)
+
+    return teacher_model, student_model
